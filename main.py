@@ -1,16 +1,12 @@
 import os
 import asyncio
 import logging
-from datetime import datetime, timedelta
+import json
 from dotenv import load_dotenv
 from telethon import TelegramClient
 from telethon.sessions import StringSession
-from telethon.tl.types import (
-    MessageMediaPhoto, 
-    MessageMediaDocument
-)
+from telethon.errors import FloodWaitError, ChatAdminRequiredError
 import requests
-import json
 
 load_dotenv()
 
@@ -30,29 +26,28 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ==================== TRACKING ====================
-SEEN_FILE = "/tmp/forwarded_messages.json"
+STATE_FILE = "/tmp/bot_state.json"
 
-def load_seen_messages():
-    """Load previously forwarded message IDs"""
-    if os.path.exists(SEEN_FILE):
+def load_state():
+    """Load bot state (last processed message IDs)"""
+    if os.path.exists(STATE_FILE):
         try:
-            with open(SEEN_FILE, 'r') as f:
-                data = json.load(f)
-                return set(data.get('message_ids', []))
+            with open(STATE_FILE, 'r') as f:
+                return json.load(f)
         except Exception as e:
-            logger.error(f"Failed to load seen messages: {e}")
-            return set()
-    return set()
+            logger.error(f"Failed to load state: {e}")
+            return {}
+    return {}
 
-def save_seen_messages(seen):
-    """Save forwarded message IDs"""
+def save_state(state):
+    """Save bot state"""
     try:
-        with open(SEEN_FILE, 'w') as f:
-            json.dump({'message_ids': list(seen)}, f)
+        with open(STATE_FILE, 'w') as f:
+            json.dump(state, f, indent=2)
     except Exception as e:
-        logger.error(f"Failed to save seen messages: {e}")
+        logger.error(f"Failed to save state: {e}")
 
-SEEN_MESSAGES = load_seen_messages()
+STATE = load_state()
 
 # ==================== BOT CLIENT ====================
 if BOT_STRING_SESSION:
@@ -82,201 +77,191 @@ def call_ai_bot(text: str) -> str:
         logger.error(f"❌ AI rewriting failed: {e}")
         return None
 
-# ==================== FORWARD LOGIC ====================
-async def process_message(message, channel_name):
-    """Process and forward a single message"""
-    global SEEN_MESSAGES
-    
+# ==================== MESSAGE FORWARDING ====================
+async def rewrite_and_forward_message(message, channel_name):
+    """Rewrite message caption and forward"""
     try:
-        msg_key = f"{channel_name}_{message.id}"
-        
-        # Skip if already forwarded
-        if msg_key in SEEN_MESSAGES:
-            logger.info(f"⏭️ Already forwarded: {msg_key}")
-            return False
-        
-        # Get text/caption
-        text = message.text or ""
+        # Get caption or text
+        caption = ""
         if message.media and hasattr(message.media, 'caption'):
-            text = message.media.caption or ""
+            caption = message.media.caption or ""
+        elif message.text:
+            caption = message.text
         
-        text = text.strip()
+        caption = caption.strip()
         
-        # Rewrite text with AI
-        rewritten_text = None
-        if text:
-            logger.info(f"📝 Rewriting: {text[:50]}...")
-            rewritten_text = call_ai_bot(text)
-            if not rewritten_text:
-                rewritten_text = text
+        # Rewrite with AI if has caption
+        rewritten_caption = None
+        if caption:
+            logger.info(f"📝 Rewriting: {caption[:50]}...")
+            rewritten_caption = call_ai_bot(caption)
+            if not rewritten_caption:
+                rewritten_caption = caption
         
-        # ================ CASE 1: TEXT ONLY ================
-        if text and not message.media:
-            logger.info(f"📝 Text only from {channel_name}")
-            await bot_client.send_message(TARGET_CHANNEL, rewritten_text, parse_mode="md")
-            logger.info(f"✅ Forwarded text")
-            SEEN_MESSAGES.add(msg_key)
+        # Forward message
+        try:
+            await bot_client.forward_messages(
+                entity=TARGET_CHANNEL,
+                messages=message.id,
+                from_peer=message.chat_id
+            )
+            
+            # If we have rewritten caption, edit it
+            if rewritten_caption and rewritten_caption != caption:
+                # Get the forwarded message to edit it
+                await asyncio.sleep(0.5)
+                
+                # Find the just-forwarded message
+                recent = await bot_client.get_messages(TARGET_CHANNEL, limit=1)
+                if recent and recent[0]:
+                    try:
+                        await bot_client.edit_message(
+                            TARGET_CHANNEL,
+                            recent[0].id,
+                            text=rewritten_caption,
+                            parse_mode="md"
+                        )
+                        logger.info(f"✅ Forwarded + edited from {channel_name}")
+                    except Exception as e:
+                        logger.warning(f"Could not edit caption: {e}")
+                        logger.info(f"✅ Forwarded (caption not edited)")
+            else:
+                logger.info(f"✅ Forwarded from {channel_name}")
+            
             return True
-        
-        # ================ CASE 2: PHOTO ================
-        if message.media and isinstance(message.media, MessageMediaPhoto):
-            logger.info(f"🖼️ Photo from {channel_name}")
-            try:
-                await bot_client.send_file(
-                    TARGET_CHANNEL,
-                    message.media.photo,
-                    caption=rewritten_text,
-                    parse_mode="md" if rewritten_text else None
-                )
-                logger.info(f"✅ Forwarded photo")
-                SEEN_MESSAGES.add(msg_key)
-                return True
-            except Exception as e:
-                logger.error(f"Failed to forward photo: {e}")
-                if rewritten_text:
-                    await bot_client.send_message(TARGET_CHANNEL, rewritten_text, parse_mode="md")
-                    SEEN_MESSAGES.add(msg_key)
-                    return True
-                return False
-        
-        # ================ CASE 3: VIDEO ================
-        if message.media and isinstance(message.media, MessageMediaDocument):
-            document = message.media.document
-            mime_type = document.mime_type if document else ""
             
-            # Check if video
-            if "video" in mime_type:
-                logger.info(f"🎥 Video from {channel_name} (mime: {mime_type})")
-                try:
-                    await bot_client.send_file(
-                        TARGET_CHANNEL,
-                        message.media.document,
-                        caption=rewritten_text,
-                        parse_mode="md" if rewritten_text else None
-                    )
-                    logger.info(f"✅ Forwarded video")
-                    SEEN_MESSAGES.add(msg_key)
-                    return True
-                except Exception as e:
-                    logger.error(f"Failed to forward video: {e}")
-                    if rewritten_text:
-                        await bot_client.send_message(TARGET_CHANNEL, rewritten_text, parse_mode="md")
-                        SEEN_MESSAGES.add(msg_key)
-                        return True
-                    return False
-            
-            # Check if GIF/animated
-            if "image/gif" in mime_type or "video/mp4" in mime_type:
-                logger.info(f"🎬 GIF/Animation from {channel_name} (mime: {mime_type})")
-                try:
-                    await bot_client.send_file(
-                        TARGET_CHANNEL,
-                        message.media.document,
-                        caption=rewritten_text,
-                        parse_mode="md" if rewritten_text else None
-                    )
-                    logger.info(f"✅ Forwarded GIF")
-                    SEEN_MESSAGES.add(msg_key)
-                    return True
-                except Exception as e:
-                    logger.error(f"Failed to forward GIF: {e}")
-                    if rewritten_text:
-                        await bot_client.send_message(TARGET_CHANNEL, rewritten_text, parse_mode="md")
-                        SEEN_MESSAGES.add(msg_key)
-                        return True
-                    return False
-            
-            # Other documents - skip
-            logger.info(f"⏭️ Skipped document type: {mime_type}")
+        except ChatAdminRequiredError:
+            logger.error(f"Bot not admin in target channel!")
             return False
-        
-        # ================ CASE 4: OTHER MEDIA ================
-        if message.media:
-            logger.info(f"⏭️ Skipped unsupported media type")
+        except FloodWaitError as e:
+            logger.warning(f"Flood wait: {e.seconds}s")
+            await asyncio.sleep(e.seconds + 1)
             return False
-        
-        # ================ CASE 5: EMPTY MESSAGE ================
-        logger.info(f"⏭️ Empty message (no text/media)")
-        return False
-        
+        except Exception as e:
+            logger.error(f"Failed to forward: {e}")
+            return False
+    
     except Exception as e:
-        logger.exception(f"❌ Error processing message: {e}")
+        logger.exception(f"Error in rewrite_and_forward: {e}")
         return False
 
-# ==================== POLLING FUNCTION ====================
-async def poll_channels():
-    """Poll all source channels for new messages"""
-    global SEEN_MESSAGES
+# ==================== MAIN PROCESSING ====================
+async def process_channels():
+    """Process all source channels for new messages"""
+    global STATE
     
-    logger.info("=" * 60)
-    logger.info("🔍 POLLING FOR NEW MESSAGES")
-    logger.info("=" * 60)
+    logger.info("=" * 70)
+    logger.info("🔍 CHECKING CHANNELS FOR NEW MESSAGES")
+    logger.info("=" * 70)
     
     total_forwarded = 0
     
     for channel in SOURCE_CHANNELS:
         try:
-            logger.info(f"\n📍 Checking channel: {channel}")
+            logger.info(f"\n📍 Channel: {channel}")
             
-            # Get last 50 messages from channel
-            messages = await bot_client.get_messages(channel, limit=50)
+            # Get last processed ID for this channel
+            last_id = STATE.get(channel, 0)
+            logger.info(f"   Last processed ID: {last_id}")
             
-            logger.info(f"📊 Found {len(messages)} messages in {channel}")
-            
-            # Process messages in reverse order (oldest first)
-            for message in reversed(messages):
-                if message:
-                    forwarded = await process_message(message, channel)
-                    if forwarded:
-                        total_forwarded += 1
-                    await asyncio.sleep(0.5)  # Small delay between messages
+            # Try to get recent messages
+            try:
+                # This might work - getting recent messages without full history
+                messages = await bot_client.get_messages(
+                    channel,
+                    limit=100,
+                    min_id=last_id
+                )
+                
+                logger.info(f"   Found {len(messages)} messages after ID {last_id}")
+                
+                if messages:
+                    # Sort by ID (newest last)
+                    messages = sorted(messages, key=lambda m: m.id)
+                    
+                    for message in messages:
+                        if message and message.id > last_id:
+                            logger.info(f"   Processing message {message.id}")
+                            
+                            # Forward and rewrite
+                            if await rewrite_and_forward_message(message, channel):
+                                total_forwarded += 1
+                                STATE[channel] = message.id
+                                await asyncio.sleep(1)
+                
+            except Exception as e:
+                # If min_id doesn't work, try limit-based approach
+                logger.warning(f"   GetMessages failed: {e}")
+                logger.info(f"   Trying alternative method...")
+                
+                try:
+                    # Get last 50 messages without specifying min_id
+                    messages = await bot_client.get_messages(channel, limit=50)
+                    
+                    if messages:
+                        messages = sorted(messages, key=lambda m: m.id)
+                        
+                        for message in messages:
+                            if message and message.id > last_id:
+                                logger.info(f"   Processing message {message.id}")
+                                
+                                if await rewrite_and_forward_message(message, channel):
+                                    total_forwarded += 1
+                                    STATE[channel] = message.id
+                                    await asyncio.sleep(1)
+                
+                except Exception as e2:
+                    logger.error(f"   Alternative method also failed: {e2}")
+                    logger.info(f"   ⚠️ Skipping {channel}")
+                    continue
         
         except Exception as e:
-            logger.error(f"❌ Error checking channel {channel}: {e}")
+            logger.exception(f"Error processing {channel}: {e}")
             continue
     
-    # Save seen messages
-    save_seen_messages(SEEN_MESSAGES)
+    # Save state
+    save_state(STATE)
     
-    logger.info("\n" + "=" * 60)
-    logger.info(f"✅ POLLING COMPLETE - Forwarded {total_forwarded} messages")
-    logger.info(f"📊 Total tracked messages: {len(SEEN_MESSAGES)}")
-    logger.info("=" * 60)
+    logger.info("\n" + "=" * 70)
+    logger.info(f"✅ PROCESSING COMPLETE")
+    logger.info(f"   Forwarded: {total_forwarded} messages")
+    logger.info(f"   Tracked channels: {len(STATE)}")
+    logger.info("=" * 70)
     
     return total_forwarded
 
 # ==================== MAIN BOT ====================
 async def main():
-    """Main bot function - runs once and exits"""
+    """Main bot function"""
     await bot_client.start()
     
-    logger.info("=" * 60)
-    logger.info("🚀 CHANNEL FORWARDER BOT (POLLING MODE)")
-    logger.info("=" * 60)
-    logger.info(f"📍 Monitoring: {SOURCE_CHANNELS}")
+    logger.info("=" * 70)
+    logger.info("🚀 TELEGRAM BOT FORWARDER (FORWARD_MESSAGES MODE)")
+    logger.info("=" * 70)
+    logger.info(f"📍 Source Channels: {SOURCE_CHANNELS}")
     logger.info(f"📤 Target Channel: {TARGET_CHANNEL}")
-    logger.info(f"🤖 AI Rewriting: {FLOWISE_URL[:50]}...")
-    logger.info("=" * 60)
+    logger.info(f"🤖 AI Rewriting: {FLOWISE_URL[:50] if FLOWISE_URL else 'Disabled'}...")
+    logger.info("=" * 70)
     
     try:
-        # Poll channels once
-        forwarded = await poll_channels()
-        logger.info(f"\n✅ Run completed successfully. Forwarded: {forwarded}")
-        
+        # Process channels
+        await process_channels()
+        logger.info("\n✅ Bot run completed successfully!")
+    
     except Exception as e:
-        logger.exception(f"❌ Bot error: {e}")
+        logger.exception(f"❌ Fatal error: {e}")
     
     finally:
         await bot_client.disconnect()
-        logger.info("\n🔌 Disconnected")
+        logger.info("🔌 Disconnected from Telegram")
 
 # ==================== ENTRY POINT ====================
 if __name__ == "__main__":
     try:
         logger.info("Starting bot...")
         bot_client.loop.run_until_complete(main())
-        logger.info("Bot finished - exiting (GitHub Actions will handle scheduling)")
+        logger.info("Bot finished - exiting")
     except KeyboardInterrupt:
-        logger.info("Shutdown signal received")
+        logger.info("⛔ Interrupted by user")
     except Exception as e:
-        logger.exception(f"Fatal error: {e}")
+        logger.exception(f"❌ Fatal: {e}")
