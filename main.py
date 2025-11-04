@@ -6,11 +6,11 @@ import time
 from dotenv import load_dotenv
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
+from telethon.tl.types import MessageMediaPhoto, MessageMediaDocument
 import requests
 
 load_dotenv()
 
-# ==================== CONFIG ====================
 API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "")
 BOT_STRING_SESSION = os.getenv("BOT_STRING_SESSION", "").strip()
@@ -18,190 +18,283 @@ FLOWISE_URL = os.getenv("FLOWISE_URL", "")
 TARGET_CHANNEL = os.getenv("TARGET_CHANNEL", "")
 SOURCE_CHANNELS = [ch.strip() for ch in os.getenv("SOURCE_CHANNELS", "").split(",") if ch.strip()]
 
-# Timeout settings (1 hour)
-TIMEOUT_SECONDS = 3600  # 1 hour
+TIMEOUT_SECONDS = 3600
 START_TIME = time.time()
 
-# ==================== LOGGING ====================
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s"
-)
-logger = logging.getLogger(__name__)
+MEDIA_BUFFER = {}
+BUFFER_DELAY = 2
 
-# ==================== TRACKING ====================
 STATE_FILE = "/tmp/bot_state.json"
 
 def load_state():
-    """Load bot state"""
     if os.path.exists(STATE_FILE):
         try:
             with open(STATE_FILE, 'r') as f:
                 return json.load(f)
-        except Exception as e:
-            logger.error(f"Failed to load state: {e}")
+        except:
             return {}
     return {}
 
 def save_state(state):
-    """Save bot state"""
     try:
         with open(STATE_FILE, 'w') as f:
-            json.dump(state, f, indent=2)
-    except Exception as e:
-        logger.error(f"Failed to save state: {e}")
+            json.dump(state, f)
+    except:
+        pass
 
-STATE = load_state()
+SEEN_MESSAGES = load_state()
 
-# ==================== BOT CLIENT ====================
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger(__name__)
+
 if BOT_STRING_SESSION:
     bot_client = TelegramClient(StringSession(BOT_STRING_SESSION), API_ID, API_HASH)
 else:
-    raise ValueError("❌ BOT_STRING_SESSION is required!")
+    raise ValueError("BOT_STRING_SESSION required!")
 
-# ==================== AI REWRITING ====================
 def call_ai_bot(text: str) -> str:
-    """Rewrite text using Flowise AI"""
     if not text or not text.strip():
         return None
     
-    payload = {
-        "question": text,
-        "streaming": False,
-        "overrideConfig": {}
-    }
+    payload = {"question": text, "streaming": False, "overrideConfig": {}}
     
     try:
         response = requests.post(FLOWISE_URL, json=payload, timeout=45)
-        response.raise_for_status()
         data = response.json()
         result = data.get("text") or data.get("data") or ""
         return result.strip() if result else None
     except Exception as e:
-        logger.error(f"❌ AI rewriting failed: {e}")
+        logger.error(f"AI failed: {e}")
         return None
 
-# ==================== CHECK TIMEOUT ====================
 def check_timeout():
-    """Check if 1 hour has passed"""
     elapsed = time.time() - START_TIME
-    if elapsed >= TIMEOUT_SECONDS:
-        logger.warning(f"⏰ TIMEOUT REACHED! ({elapsed:.0f}s)")
-        logger.info("Exiting to restart...")
-        return True
-    return False
+    return elapsed >= TIMEOUT_SECONDS
 
-# ==================== MESSAGE HANDLER ====================
-async def handle_new_message(event):
-    """Handle incoming messages"""
-    global STATE
+def is_valid_media(media):
+    """
+    Check if IMAGES, GIFs, or VIDEOS
+    SKIP: documents, audio, etc
+    """
+    
+    # ✅ PHOTO
+    if isinstance(media, MessageMediaPhoto):
+        return True, "IMAGE"
+    
+    # Document check
+    if isinstance(media, MessageMediaDocument):
+        doc = media.document
+        mime_type = doc.mime_type if doc else ""
+        
+        # ✅ GIF (animation)
+        if "image/gif" in mime_type:
+            return True, "GIF"
+        
+        # ✅ VIDEO (treat like GIF - stream, no chunking!)
+        if "video" in mime_type:
+            return True, "VIDEO"
+        
+        # ❌ Everything else (audio, documents, etc)
+        return False, "OTHER"
+    
+    return False, "UNKNOWN"
+
+async def send_buffered_media(channel_id, chat_title):
+    global MEDIA_BUFFER, SEEN_MESSAGES
+    
+    if channel_id not in MEDIA_BUFFER:
+        return
     
     try:
-        # Check timeout before processing
+        buffer = MEDIA_BUFFER[channel_id]
+        media_list = buffer['media']
+        caption = buffer['caption']
+        msg_ids = buffer['msg_ids']
+        
+        if not media_list:
+            return
+        
+        logger.info(f"📦 Sending {len(media_list)} media")
+        
+        # Mark as seen
+        for msg_id in msg_ids:
+            key = f"{channel_id}_{msg_id}"
+            SEEN_MESSAGES[key] = True
+        save_state(SEEN_MESSAGES)
+        
+        # Rewrite caption
+        rewritten_caption = None
+        if caption:
+            logger.info(f"📝 Rewriting: {caption[:60]}...")
+            rewritten_caption = call_ai_bot(caption)
+            if not rewritten_caption:
+                rewritten_caption = caption
+        
+        # Send (NO chunking - Telethon handles it!)
+        try:
+            if len(media_list) == 1:
+                await bot_client.send_file(
+                    TARGET_CHANNEL,
+                    media_list[0],
+                    caption=rewritten_caption,
+                    parse_mode="md" if rewritten_caption else None
+                )
+                logger.info(f"✅ Sent 1 media")
+            else:
+                await bot_client.send_file(
+                    TARGET_CHANNEL,
+                    media_list,
+                    caption=rewritten_caption,
+                    parse_mode="md" if rewritten_caption else None
+                )
+                logger.info(f"✅ Sent {len(media_list)} as album")
+        except Exception as e:
+            logger.error(f"Send failed: {e}")
+        
+        del MEDIA_BUFFER[channel_id]
+    
+    except Exception as e:
+        logger.exception(f"Error: {e}")
+
+async def handle_new_message(event):
+    global MEDIA_BUFFER, SEEN_MESSAGES
+    
+    try:
         if check_timeout():
             await bot_client.disconnect()
             return
         
         message = event.message
-        channel_name = event.chat.title or f"Channel {event.chat_id}"
+        channel_id = event.chat_id
+        msg_id = message.id
+        chat_title = event.chat.title or f"Channel {channel_id}"
         
-        logger.info(f"📨 New message from {channel_name}")
+        key = f"{channel_id}_{msg_id}"
+        if key in SEEN_MESSAGES:
+            logger.info(f"⏭️ Already processed: {msg_id}")
+            return
         
-        # Get caption/text
-        caption = message.text or ""
+        logger.info(f"📨 Message #{msg_id} from {chat_title}")
+        
+        # Get text/caption
+        text = message.text or ""
+        caption = ""
         if message.media and hasattr(message.media, 'caption'):
             caption = message.media.caption or ""
         
+        text = text.strip()
         caption = caption.strip()
         
-        # Rewrite with AI
-        rewritten = None
-        if caption:
-            logger.info(f"📝 Rewriting: {caption[:50]}...")
-            rewritten = call_ai_bot(caption)
-            if not rewritten:
-                rewritten = caption
-        
-        # Forward message
-        try:
-            await bot_client.forward_messages(
-                entity=TARGET_CHANNEL,
-                messages=message.id,
-                from_peer=message.chat_id
-            )
+        # ================ CASE 1: TEXT ONLY (NO MEDIA) ================
+        if text and not message.media:
+            logger.info(f"📝 TEXT ONLY")
             
-            # Edit caption if rewritten
-            if rewritten and rewritten != caption:
-                await asyncio.sleep(0.5)
-                try:
-                    recent = await bot_client.get_messages(TARGET_CHANNEL, limit=1)
-                    if recent and recent[0]:
-                        await bot_client.edit_message(
-                            TARGET_CHANNEL,
-                            recent[0].id,
-                            text=rewritten,
-                            parse_mode="md"
-                        )
-                        logger.info(f"✅ Forwarded + edited from {channel_name}")
-                except:
-                    logger.info(f"✅ Forwarded from {channel_name}")
-            else:
-                logger.info(f"✅ Forwarded from {channel_name}")
+            # Rewrite
+            rewritten = call_ai_bot(text)
+            if not rewritten:
+                rewritten = text
+            
+            # Send
+            try:
+                await bot_client.send_message(TARGET_CHANNEL, rewritten, parse_mode="md")
+                logger.info(f"✅ Sent text")
+            except Exception as e:
+                logger.error(f"Send failed: {e}")
+            
+            # Mark seen
+            SEEN_MESSAGES[key] = True
+            save_state(SEEN_MESSAGES)
+            return
         
-        except Exception as e:
-            logger.error(f"Failed to forward: {e}")
-    
+        # ================ CASE 2: NO TEXT, NO MEDIA ================
+        if not text and not message.media:
+            logger.info(f"⏭️ Empty message - skip")
+            SEEN_MESSAGES[key] = True
+            save_state(SEEN_MESSAGES)
+            return
+        
+        # ================ CASE 3: MEDIA (WITH OR WITHOUT CAPTION) ================
+        if message.media:
+            is_valid, media_type = is_valid_media(message.media)
+            logger.info(f"📊 Media: {media_type}")
+            
+            # Invalid media? Skip
+            if not is_valid:
+                logger.info(f"❌ {media_type} - skipping")
+                SEEN_MESSAGES[key] = True
+                save_state(SEEN_MESSAGES)
+                return
+            
+            # ✅ VALID (IMAGE, GIF, or VIDEO)
+            logger.info(f"✅ Valid - buffering")
+            
+            # Use caption if exists, otherwise use text, otherwise empty
+            full_caption = caption if caption else text
+            
+            if channel_id not in MEDIA_BUFFER:
+                MEDIA_BUFFER[channel_id] = {
+                    'media': [],
+                    'caption': full_caption,
+                    'msg_ids': [],
+                    'timer': None
+                }
+            
+            MEDIA_BUFFER[channel_id]['media'].append(message.media)
+            MEDIA_BUFFER[channel_id]['msg_ids'].append(msg_id)
+            
+            if MEDIA_BUFFER[channel_id]['timer']:
+                MEDIA_BUFFER[channel_id]['timer'].cancel()
+            
+            async def send_after_delay():
+                await asyncio.sleep(BUFFER_DELAY)
+                await send_buffered_media(channel_id, chat_title)
+            
+            task = asyncio.create_task(send_after_delay())
+            MEDIA_BUFFER[channel_id]['timer'] = task
+            
+            logger.info(f"📦 Buffering ({len(MEDIA_BUFFER[channel_id]['media'])} item)")
+            return
+        
     except Exception as e:
-        logger.exception(f"Error in handle_new_message: {e}")
+        logger.exception(f"Error: {e}")
 
-# ==================== MAIN BOT ====================
 async def main():
-    """Main bot function - runs for 1 hour then exits"""
     await bot_client.start()
     
     logger.info("=" * 70)
-    logger.info("🚀 TELEGRAM BOT FORWARDER (EVENT-BASED, 1-HOUR MODE)")
+    logger.info("🚀 TELEGRAM BOT FORWARDER")
     logger.info("=" * 70)
-    logger.info(f"📍 Source Channels: {SOURCE_CHANNELS}")
-    logger.info(f"📤 Target Channel: {TARGET_CHANNEL}")
-    logger.info(f"🤖 AI Rewriting: {FLOWISE_URL[:50] if FLOWISE_URL else 'Disabled'}...")
-    logger.info(f"⏰ Timeout: {TIMEOUT_SECONDS // 60} minutes")
+    logger.info(f"📍 Source: {SOURCE_CHANNELS}")
+    logger.info(f"📤 Target: {TARGET_CHANNEL}")
+    logger.info(f"🤖 AI: {FLOWISE_URL[:50] if FLOWISE_URL else 'None'}...")
     logger.info("=" * 70)
-    logger.info("✅ Listening for new messages (will timeout in 1 hour)...")
+    logger.info("✅ TEXT ONLY → rewrite + send")
+    logger.info("✅ IMAGES (+ caption) → rewrite + send")
+    logger.info("✅ GIFs (+ caption) → rewrite + send")
+    logger.info("✅ VIDEOS (+ caption) → rewrite + send")
+    logger.info("✅ Multiple media → group as album")
+    logger.info("✅ NO duplicates")
     logger.info("=" * 70)
     
-    # Register event handler
     @bot_client.on(events.NewMessage(chats=SOURCE_CHANNELS))
     async def handler(event):
         await handle_new_message(event)
     
-    # Run with timeout check
     try:
         while True:
-            # Check timeout every 10 seconds
             if check_timeout():
-                logger.info("⏰ Time limit reached - disconnecting...")
+                logger.info("Timeout - exiting")
                 break
-            
             await asyncio.sleep(10)
-            
-    except KeyboardInterrupt:
-        logger.info("⛔ Interrupted by user")
-    except Exception as e:
-        logger.exception(f"❌ Error: {e}")
-    
-    finally:
-        await bot_client.disconnect()
-        logger.info("🔌 Disconnected")
-        logger.info("✅ Exiting - GitHub Actions will restart in 1 hour")
-
-# ==================== ENTRY POINT ====================
-if __name__ == "__main__":
-    try:
-        logger.info(f"Starting bot... (will run for {TIMEOUT_SECONDS // 60} minutes)")
-        bot_client.loop.run_until_complete(main())
-        logger.info("Bot finished - exiting")
     except KeyboardInterrupt:
         logger.info("Interrupted")
+    finally:
+        await bot_client.disconnect()
+        logger.info("Done")
+
+if __name__ == "__main__":
+    try:
+        logger.info("Starting...")
+        bot_client.loop.run_until_complete(main())
     except Exception as e:
-        logger.exception(f"Fatal error: {e}")
+        logger.exception(f"Fatal: {e}")
