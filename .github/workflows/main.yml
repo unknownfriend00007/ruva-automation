@@ -1,14 +1,14 @@
-name: Channel Forwarder Bot - Polling
+name: Telegram Bot Forwarder
 
 on:
   schedule:
     - cron: '*/30 * * * *'  # Every 30 minutes
-  workflow_dispatch:        # Manual trigger
+  workflow_dispatch:
 
 jobs:
   forwarder:
     runs-on: ubuntu-latest
-    timeout-minutes: 10  # Should finish in ~2 mins
+    timeout-minutes: 10
     
     steps:
       - uses: actions/checkout@v3
@@ -23,7 +23,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
       
-      - name: Run bot - Fetch and forward messages
+      - name: Run bot
         env:
           API_ID: ${{ secrets.API_ID }}
           API_HASH: ${{ secrets.API_HASH }}
@@ -31,15 +31,12 @@ jobs:
           FLOWISE_URL: ${{ secrets.FLOWISE_URL }}
           TARGET_CHANNEL: ${{ secrets.TARGET_CHANNEL }}
           SOURCE_CHANNELS: ${{ secrets.SOURCE_CHANNELS }}
+        run: python main.py
+      
+      - name: Commit state changes
         run: |
-          echo "🚀 Starting bot polling..."
-          python main.py
-          echo "✅ Bot polling completed"
-      
-      - name: Log completion
-        if: success()
-        run: echo "✅ Workflow completed successfully at $(date)"
-      
-      - name: Log failure
-        if: failure()
-        run: echo "❌ Workflow failed at $(date)"
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add -A || true
+          git commit -m "Auto: Bot state update" || true
+          git push || true
