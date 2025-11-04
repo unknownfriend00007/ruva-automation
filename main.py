@@ -2,10 +2,10 @@ import os
 import asyncio
 import logging
 import json
+import time
 from dotenv import load_dotenv
-from telethon import TelegramClient
+from telethon import TelegramClient, events
 from telethon.sessions import StringSession
-from telethon.errors import FloodWaitError, ChatAdminRequiredError
 import requests
 
 load_dotenv()
@@ -18,6 +18,10 @@ FLOWISE_URL = os.getenv("FLOWISE_URL", "")
 TARGET_CHANNEL = os.getenv("TARGET_CHANNEL", "")
 SOURCE_CHANNELS = [ch.strip() for ch in os.getenv("SOURCE_CHANNELS", "").split(",") if ch.strip()]
 
+# Timeout settings (1 hour)
+TIMEOUT_SECONDS = 3600  # 1 hour
+START_TIME = time.time()
+
 # ==================== LOGGING ====================
 logging.basicConfig(
     level=logging.INFO,
@@ -29,7 +33,7 @@ logger = logging.getLogger(__name__)
 STATE_FILE = "/tmp/bot_state.json"
 
 def load_state():
-    """Load bot state (last processed message IDs)"""
+    """Load bot state"""
     if os.path.exists(STATE_FILE):
         try:
             with open(STATE_FILE, 'r') as f:
@@ -77,26 +81,46 @@ def call_ai_bot(text: str) -> str:
         logger.error(f"❌ AI rewriting failed: {e}")
         return None
 
-# ==================== MESSAGE FORWARDING ====================
-async def rewrite_and_forward_message(message, channel_name):
-    """Rewrite message caption and forward"""
+# ==================== CHECK TIMEOUT ====================
+def check_timeout():
+    """Check if 1 hour has passed"""
+    elapsed = time.time() - START_TIME
+    if elapsed >= TIMEOUT_SECONDS:
+        logger.warning(f"⏰ TIMEOUT REACHED! ({elapsed:.0f}s)")
+        logger.info("Exiting to restart...")
+        return True
+    return False
+
+# ==================== MESSAGE HANDLER ====================
+async def handle_new_message(event):
+    """Handle incoming messages"""
+    global STATE
+    
     try:
-        # Get caption or text
-        caption = ""
+        # Check timeout before processing
+        if check_timeout():
+            await bot_client.disconnect()
+            return
+        
+        message = event.message
+        channel_name = event.chat.title or f"Channel {event.chat_id}"
+        
+        logger.info(f"📨 New message from {channel_name}")
+        
+        # Get caption/text
+        caption = message.text or ""
         if message.media and hasattr(message.media, 'caption'):
             caption = message.media.caption or ""
-        elif message.text:
-            caption = message.text
         
         caption = caption.strip()
         
-        # Rewrite with AI if has caption
-        rewritten_caption = None
+        # Rewrite with AI
+        rewritten = None
         if caption:
             logger.info(f"📝 Rewriting: {caption[:50]}...")
-            rewritten_caption = call_ai_bot(caption)
-            if not rewritten_caption:
-                rewritten_caption = caption
+            rewritten = call_ai_bot(caption)
+            if not rewritten:
+                rewritten = caption
         
         # Forward message
         try:
@@ -106,162 +130,78 @@ async def rewrite_and_forward_message(message, channel_name):
                 from_peer=message.chat_id
             )
             
-            # If we have rewritten caption, edit it
-            if rewritten_caption and rewritten_caption != caption:
-                # Get the forwarded message to edit it
+            # Edit caption if rewritten
+            if rewritten and rewritten != caption:
                 await asyncio.sleep(0.5)
-                
-                # Find the just-forwarded message
-                recent = await bot_client.get_messages(TARGET_CHANNEL, limit=1)
-                if recent and recent[0]:
-                    try:
+                try:
+                    recent = await bot_client.get_messages(TARGET_CHANNEL, limit=1)
+                    if recent and recent[0]:
                         await bot_client.edit_message(
                             TARGET_CHANNEL,
                             recent[0].id,
-                            text=rewritten_caption,
+                            text=rewritten,
                             parse_mode="md"
                         )
                         logger.info(f"✅ Forwarded + edited from {channel_name}")
-                    except Exception as e:
-                        logger.warning(f"Could not edit caption: {e}")
-                        logger.info(f"✅ Forwarded (caption not edited)")
+                except:
+                    logger.info(f"✅ Forwarded from {channel_name}")
             else:
                 logger.info(f"✅ Forwarded from {channel_name}")
-            
-            return True
-            
-        except ChatAdminRequiredError:
-            logger.error(f"Bot not admin in target channel!")
-            return False
-        except FloodWaitError as e:
-            logger.warning(f"Flood wait: {e.seconds}s")
-            await asyncio.sleep(e.seconds + 1)
-            return False
-        except Exception as e:
-            logger.error(f"Failed to forward: {e}")
-            return False
-    
-    except Exception as e:
-        logger.exception(f"Error in rewrite_and_forward: {e}")
-        return False
-
-# ==================== MAIN PROCESSING ====================
-async def process_channels():
-    """Process all source channels for new messages"""
-    global STATE
-    
-    logger.info("=" * 70)
-    logger.info("🔍 CHECKING CHANNELS FOR NEW MESSAGES")
-    logger.info("=" * 70)
-    
-    total_forwarded = 0
-    
-    for channel in SOURCE_CHANNELS:
-        try:
-            logger.info(f"\n📍 Channel: {channel}")
-            
-            # Get last processed ID for this channel
-            last_id = STATE.get(channel, 0)
-            logger.info(f"   Last processed ID: {last_id}")
-            
-            # Try to get recent messages
-            try:
-                # This might work - getting recent messages without full history
-                messages = await bot_client.get_messages(
-                    channel,
-                    limit=100,
-                    min_id=last_id
-                )
-                
-                logger.info(f"   Found {len(messages)} messages after ID {last_id}")
-                
-                if messages:
-                    # Sort by ID (newest last)
-                    messages = sorted(messages, key=lambda m: m.id)
-                    
-                    for message in messages:
-                        if message and message.id > last_id:
-                            logger.info(f"   Processing message {message.id}")
-                            
-                            # Forward and rewrite
-                            if await rewrite_and_forward_message(message, channel):
-                                total_forwarded += 1
-                                STATE[channel] = message.id
-                                await asyncio.sleep(1)
-                
-            except Exception as e:
-                # If min_id doesn't work, try limit-based approach
-                logger.warning(f"   GetMessages failed: {e}")
-                logger.info(f"   Trying alternative method...")
-                
-                try:
-                    # Get last 50 messages without specifying min_id
-                    messages = await bot_client.get_messages(channel, limit=50)
-                    
-                    if messages:
-                        messages = sorted(messages, key=lambda m: m.id)
-                        
-                        for message in messages:
-                            if message and message.id > last_id:
-                                logger.info(f"   Processing message {message.id}")
-                                
-                                if await rewrite_and_forward_message(message, channel):
-                                    total_forwarded += 1
-                                    STATE[channel] = message.id
-                                    await asyncio.sleep(1)
-                
-                except Exception as e2:
-                    logger.error(f"   Alternative method also failed: {e2}")
-                    logger.info(f"   ⚠️ Skipping {channel}")
-                    continue
         
         except Exception as e:
-            logger.exception(f"Error processing {channel}: {e}")
-            continue
+            logger.error(f"Failed to forward: {e}")
     
-    # Save state
-    save_state(STATE)
-    
-    logger.info("\n" + "=" * 70)
-    logger.info(f"✅ PROCESSING COMPLETE")
-    logger.info(f"   Forwarded: {total_forwarded} messages")
-    logger.info(f"   Tracked channels: {len(STATE)}")
-    logger.info("=" * 70)
-    
-    return total_forwarded
+    except Exception as e:
+        logger.exception(f"Error in handle_new_message: {e}")
 
 # ==================== MAIN BOT ====================
 async def main():
-    """Main bot function"""
+    """Main bot function - runs for 1 hour then exits"""
     await bot_client.start()
     
     logger.info("=" * 70)
-    logger.info("🚀 TELEGRAM BOT FORWARDER (FORWARD_MESSAGES MODE)")
+    logger.info("🚀 TELEGRAM BOT FORWARDER (EVENT-BASED, 1-HOUR MODE)")
     logger.info("=" * 70)
     logger.info(f"📍 Source Channels: {SOURCE_CHANNELS}")
     logger.info(f"📤 Target Channel: {TARGET_CHANNEL}")
     logger.info(f"🤖 AI Rewriting: {FLOWISE_URL[:50] if FLOWISE_URL else 'Disabled'}...")
+    logger.info(f"⏰ Timeout: {TIMEOUT_SECONDS // 60} minutes")
+    logger.info("=" * 70)
+    logger.info("✅ Listening for new messages (will timeout in 1 hour)...")
     logger.info("=" * 70)
     
-    try:
-        # Process channels
-        await process_channels()
-        logger.info("\n✅ Bot run completed successfully!")
+    # Register event handler
+    @bot_client.on(events.NewMessage(chats=SOURCE_CHANNELS))
+    async def handler(event):
+        await handle_new_message(event)
     
+    # Run with timeout check
+    try:
+        while True:
+            # Check timeout every 10 seconds
+            if check_timeout():
+                logger.info("⏰ Time limit reached - disconnecting...")
+                break
+            
+            await asyncio.sleep(10)
+            
+    except KeyboardInterrupt:
+        logger.info("⛔ Interrupted by user")
     except Exception as e:
-        logger.exception(f"❌ Fatal error: {e}")
+        logger.exception(f"❌ Error: {e}")
     
     finally:
         await bot_client.disconnect()
-        logger.info("🔌 Disconnected from Telegram")
+        logger.info("🔌 Disconnected")
+        logger.info("✅ Exiting - GitHub Actions will restart in 1 hour")
 
 # ==================== ENTRY POINT ====================
 if __name__ == "__main__":
     try:
-        logger.info("Starting bot...")
+        logger.info(f"Starting bot... (will run for {TIMEOUT_SECONDS // 60} minutes)")
         bot_client.loop.run_until_complete(main())
         logger.info("Bot finished - exiting")
     except KeyboardInterrupt:
-        logger.info("⛔ Interrupted by user")
+        logger.info("Interrupted")
     except Exception as e:
-        logger.exception(f"❌ Fatal: {e}")
+        logger.exception(f"Fatal error: {e}")
