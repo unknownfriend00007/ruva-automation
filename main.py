@@ -1,17 +1,16 @@
 import os
 import asyncio
 import logging
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
-from telethon import TelegramClient, events
+from telethon import TelegramClient
 from telethon.sessions import StringSession
 from telethon.tl.types import (
     MessageMediaPhoto, 
-    MessageMediaDocument,
-    TypeInputMedia,
-    InputMediaPhoto,
-    InputMediaDocument
+    MessageMediaDocument
 )
 import requests
+import json
 
 load_dotenv()
 
@@ -29,6 +28,31 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s"
 )
 logger = logging.getLogger(__name__)
+
+# ==================== TRACKING ====================
+SEEN_FILE = "/tmp/forwarded_messages.json"
+
+def load_seen_messages():
+    """Load previously forwarded message IDs"""
+    if os.path.exists(SEEN_FILE):
+        try:
+            with open(SEEN_FILE, 'r') as f:
+                data = json.load(f)
+                return set(data.get('message_ids', []))
+        except Exception as e:
+            logger.error(f"Failed to load seen messages: {e}")
+            return set()
+    return set()
+
+def save_seen_messages(seen):
+    """Save forwarded message IDs"""
+    try:
+        with open(SEEN_FILE, 'w') as f:
+            json.dump({'message_ids': list(seen)}, f)
+    except Exception as e:
+        logger.error(f"Failed to save seen messages: {e}")
+
+SEEN_MESSAGES = load_seen_messages()
 
 # ==================== BOT CLIENT ====================
 if BOT_STRING_SESSION:
@@ -59,10 +83,17 @@ def call_ai_bot(text: str) -> str:
         return None
 
 # ==================== FORWARD LOGIC ====================
-async def forward_message(event):
-    """Forward message preserving media grouping"""
+async def process_message(message, channel_name):
+    """Process and forward a single message"""
+    global SEEN_MESSAGES
+    
     try:
-        message = event.message
+        msg_key = f"{channel_name}_{message.id}"
+        
+        # Skip if already forwarded
+        if msg_key in SEEN_MESSAGES:
+            logger.info(f"⏭️ Already forwarded: {msg_key}")
+            return False
         
         # Get text/caption
         text = message.text or ""
@@ -76,38 +107,20 @@ async def forward_message(event):
         if text:
             logger.info(f"📝 Rewriting: {text[:50]}...")
             rewritten_text = call_ai_bot(text)
-            # If AI fails, use original
             if not rewritten_text:
                 rewritten_text = text
         
-        # Handle grouped messages (albums)
-        if message.grouped_id:
-            logger.info(f"📦 Album detected (grouped_id: {message.grouped_id})")
-            # Get all messages in group
-            group_messages = await bot_client.get_messages(
-                event.chat_id,
-                ids=message.id,
-                limit=10
-            )
-            
-            # This requires special handling - see Case 1 below
-        
-        # ================ CASE 1: GROUPED MEDIA (ALBUM) ================
-        if message.grouped_id:
-            logger.info(f"🖼️ Processing grouped media...")
-            await handle_grouped_media(event, rewritten_text)
-            return
-        
-        # ================ CASE 2: TEXT ONLY ================
+        # ================ CASE 1: TEXT ONLY ================
         if text and not message.media:
-            logger.info(f"📝 Text only")
+            logger.info(f"📝 Text only from {channel_name}")
             await bot_client.send_message(TARGET_CHANNEL, rewritten_text, parse_mode="md")
             logger.info(f"✅ Forwarded text")
-            return
+            SEEN_MESSAGES.add(msg_key)
+            return True
         
-        # ================ CASE 3: PHOTO ================
+        # ================ CASE 2: PHOTO ================
         if message.media and isinstance(message.media, MessageMediaPhoto):
-            logger.info(f"🖼️ Photo")
+            logger.info(f"🖼️ Photo from {channel_name}")
             try:
                 await bot_client.send_file(
                     TARGET_CHANNEL,
@@ -116,20 +129,24 @@ async def forward_message(event):
                     parse_mode="md" if rewritten_text else None
                 )
                 logger.info(f"✅ Forwarded photo")
+                SEEN_MESSAGES.add(msg_key)
+                return True
             except Exception as e:
                 logger.error(f"Failed to forward photo: {e}")
                 if rewritten_text:
                     await bot_client.send_message(TARGET_CHANNEL, rewritten_text, parse_mode="md")
-            return
+                    SEEN_MESSAGES.add(msg_key)
+                    return True
+                return False
         
-        # ================ CASE 4: VIDEO ================
+        # ================ CASE 3: VIDEO ================
         if message.media and isinstance(message.media, MessageMediaDocument):
             document = message.media.document
             mime_type = document.mime_type if document else ""
             
             # Check if video
             if "video" in mime_type:
-                logger.info(f"🎥 Video (mime: {mime_type})")
+                logger.info(f"🎥 Video from {channel_name} (mime: {mime_type})")
                 try:
                     await bot_client.send_file(
                         TARGET_CHANNEL,
@@ -138,15 +155,19 @@ async def forward_message(event):
                         parse_mode="md" if rewritten_text else None
                     )
                     logger.info(f"✅ Forwarded video")
+                    SEEN_MESSAGES.add(msg_key)
+                    return True
                 except Exception as e:
                     logger.error(f"Failed to forward video: {e}")
                     if rewritten_text:
                         await bot_client.send_message(TARGET_CHANNEL, rewritten_text, parse_mode="md")
-                return
+                        SEEN_MESSAGES.add(msg_key)
+                        return True
+                    return False
             
             # Check if GIF/animated
             if "image/gif" in mime_type or "video/mp4" in mime_type:
-                logger.info(f"🎬 GIF/Animation (mime: {mime_type})")
+                logger.info(f"🎬 GIF/Animation from {channel_name} (mime: {mime_type})")
                 try:
                     await bot_client.send_file(
                         TARGET_CHANNEL,
@@ -155,83 +176,106 @@ async def forward_message(event):
                         parse_mode="md" if rewritten_text else None
                     )
                     logger.info(f"✅ Forwarded GIF")
+                    SEEN_MESSAGES.add(msg_key)
+                    return True
                 except Exception as e:
                     logger.error(f"Failed to forward GIF: {e}")
                     if rewritten_text:
                         await bot_client.send_message(TARGET_CHANNEL, rewritten_text, parse_mode="md")
-                return
+                        SEEN_MESSAGES.add(msg_key)
+                        return True
+                    return False
             
             # Other documents - skip
             logger.info(f"⏭️ Skipped document type: {mime_type}")
-            return
+            return False
         
-        # ================ CASE 5: OTHER MEDIA ================
+        # ================ CASE 4: OTHER MEDIA ================
         if message.media:
             logger.info(f"⏭️ Skipped unsupported media type")
-            return
+            return False
         
-        # ================ CASE 6: EMPTY MESSAGE ================
+        # ================ CASE 5: EMPTY MESSAGE ================
         logger.info(f"⏭️ Empty message (no text/media)")
+        return False
         
     except Exception as e:
-        logger.exception(f"❌ Error in forward_message: {e}")
+        logger.exception(f"❌ Error processing message: {e}")
+        return False
 
-# ==================== GROUPED MEDIA HANDLER ====================
-async def handle_grouped_media(event, rewritten_text):
-    """Handle grouped media (albums) - forward as-is"""
-    try:
-        message = event.message
-        chat_id = event.chat_id
+# ==================== POLLING FUNCTION ====================
+async def poll_channels():
+    """Poll all source channels for new messages"""
+    global SEEN_MESSAGES
+    
+    logger.info("=" * 60)
+    logger.info("🔍 POLLING FOR NEW MESSAGES")
+    logger.info("=" * 60)
+    
+    total_forwarded = 0
+    
+    for channel in SOURCE_CHANNELS:
+        try:
+            logger.info(f"\n📍 Checking channel: {channel}")
+            
+            # Get last 50 messages from channel
+            messages = await bot_client.get_messages(channel, limit=50)
+            
+            logger.info(f"📊 Found {len(messages)} messages in {channel}")
+            
+            # Process messages in reverse order (oldest first)
+            for message in reversed(messages):
+                if message:
+                    forwarded = await process_message(message, channel)
+                    if forwarded:
+                        total_forwarded += 1
+                    await asyncio.sleep(0.5)  # Small delay between messages
         
-        # Forward the media directly (preserves grouping)
-        await bot_client.send_file(
-            TARGET_CHANNEL,
-            message.media,
-            caption=rewritten_text if rewritten_text else None,
-            parse_mode="md" if rewritten_text else None
-        )
-        logger.info(f"✅ Forwarded grouped media")
-        
-    except Exception as e:
-        logger.error(f"❌ Failed to forward grouped media: {e}")
-        if rewritten_text:
-            await bot_client.send_message(TARGET_CHANNEL, rewritten_text, parse_mode="md")
+        except Exception as e:
+            logger.error(f"❌ Error checking channel {channel}: {e}")
+            continue
+    
+    # Save seen messages
+    save_seen_messages(SEEN_MESSAGES)
+    
+    logger.info("\n" + "=" * 60)
+    logger.info(f"✅ POLLING COMPLETE - Forwarded {total_forwarded} messages")
+    logger.info(f"📊 Total tracked messages: {len(SEEN_MESSAGES)}")
+    logger.info("=" * 60)
+    
+    return total_forwarded
 
 # ==================== MAIN BOT ====================
 async def main():
-    """Main bot function"""
+    """Main bot function - runs once and exits"""
     await bot_client.start()
     
-    logger.info("=" * 50)
-    logger.info("🚀 CHANNEL FORWARDER BOT STARTED")
-    logger.info("=" * 50)
+    logger.info("=" * 60)
+    logger.info("🚀 CHANNEL FORWARDER BOT (POLLING MODE)")
+    logger.info("=" * 60)
     logger.info(f"📍 Monitoring: {SOURCE_CHANNELS}")
     logger.info(f"📤 Target Channel: {TARGET_CHANNEL}")
     logger.info(f"🤖 AI Rewriting: {FLOWISE_URL[:50]}...")
-    logger.info("=" * 50)
-    
-    # Register event handler
-    @bot_client.on(events.NewMessage(chats=SOURCE_CHANNELS))
-    async def handler(event):
-        await forward_message(event)
-    
-    logger.info("✅ Event handlers registered. Listening...")
-    logger.info("=" * 50)
+    logger.info("=" * 60)
     
     try:
-        await bot_client.run_until_disconnected()
-    except KeyboardInterrupt:
-        logger.info("⛔ Bot stopped by user")
+        # Poll channels once
+        forwarded = await poll_channels()
+        logger.info(f"\n✅ Run completed successfully. Forwarded: {forwarded}")
+        
     except Exception as e:
         logger.exception(f"❌ Bot error: {e}")
+    
     finally:
         await bot_client.disconnect()
-        logger.info("🔌 Disconnected")
+        logger.info("\n🔌 Disconnected")
 
 # ==================== ENTRY POINT ====================
 if __name__ == "__main__":
     try:
+        logger.info("Starting bot...")
         bot_client.loop.run_until_complete(main())
+        logger.info("Bot finished - exiting (GitHub Actions will handle scheduling)")
     except KeyboardInterrupt:
         logger.info("Shutdown signal received")
     except Exception as e:
