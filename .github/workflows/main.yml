@@ -1,15 +1,14 @@
-name: Channel Forwarder
+name: Channel Forwarder Bot - Polling
 
 on:
-  workflow_dispatch:
-  push:
-    branches:
-      - main
+  schedule:
+    - cron: '*/30 * * * *'  # Every 30 minutes
+  workflow_dispatch:        # Manual trigger
 
 jobs:
   forwarder:
     runs-on: ubuntu-latest
-    timeout-minutes: 500
+    timeout-minutes: 10  # Should finish in ~2 mins
     
     steps:
       - uses: actions/checkout@v3
@@ -24,7 +23,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
       
-      - name: Run bot
+      - name: Run bot - Fetch and forward messages
         env:
           API_ID: ${{ secrets.API_ID }}
           API_HASH: ${{ secrets.API_HASH }}
@@ -32,4 +31,15 @@ jobs:
           FLOWISE_URL: ${{ secrets.FLOWISE_URL }}
           TARGET_CHANNEL: ${{ secrets.TARGET_CHANNEL }}
           SOURCE_CHANNELS: ${{ secrets.SOURCE_CHANNELS }}
-        run: python main.py
+        run: |
+          echo "🚀 Starting bot polling..."
+          python main.py
+          echo "✅ Bot polling completed"
+      
+      - name: Log completion
+        if: success()
+        run: echo "✅ Workflow completed successfully at $(date)"
+      
+      - name: Log failure
+        if: failure()
+        run: echo "❌ Workflow failed at $(date)"
