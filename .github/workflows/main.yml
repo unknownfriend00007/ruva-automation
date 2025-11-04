@@ -1,14 +1,15 @@
-name: Telegram Bot Forwarder
+name: Telegram Bot Forwarder - Continuous
 
 on:
-  schedule:
-    - cron: '*/30 * * * *'  # Every 30 minutes
   workflow_dispatch:
+  push:
+    branches:
+      - main
 
 jobs:
   forwarder:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 75  # Slightly longer than 1 hour
     
     steps:
       - uses: actions/checkout@v3
@@ -23,7 +24,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
       
-      - name: Run bot
+      - name: Run bot (1 hour)
         env:
           API_ID: ${{ secrets.API_ID }}
           API_HASH: ${{ secrets.API_HASH }}
@@ -33,10 +34,17 @@ jobs:
           SOURCE_CHANNELS: ${{ secrets.SOURCE_CHANNELS }}
         run: python main.py
       
-      - name: Commit state changes
-        run: |
-          git config --local user.email "action@github.com"
-          git config --local user.name "GitHub Action"
-          git add -A || true
-          git commit -m "Auto: Bot state update" || true
-          git push || true
+      - name: Trigger next run
+        if: success()
+        uses: actions/github-script@v6
+        with:
+          script: |
+            github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'main.yml',
+              ref: 'main'
+            })
+      
+      - name: Wait before next trigger (safety)
+        run: sleep 30
