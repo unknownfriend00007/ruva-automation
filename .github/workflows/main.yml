@@ -6,7 +6,11 @@ on:
     branches:
       - main
   schedule:
-    - cron: '0 * * * *'  # Every hour at minute 0
+    - cron: '*/60 * * * *'
+
+concurrency:
+  group: telegram-bot
+  cancel-in-progress: true
 
 jobs:
   forwarder:
@@ -30,6 +34,11 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
       
+      - name: Create run lock file
+        run: |
+          mkdir -p .github/locks
+          date > .github/locks/current-run
+      
       - name: Run bot (1 hour)
         env:
           API_ID: ${{ secrets.API_ID }}
@@ -39,3 +48,12 @@ jobs:
           TARGET_CHANNEL: ${{ secrets.TARGET_CHANNEL }}
           SOURCE_CHANNELS: ${{ secrets.SOURCE_CHANNELS }}
         run: python main.py
+      
+      - name: Commit keepalive to trigger next run
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          date > .github/.last-run
+          git add .github/.last-run .github/locks/current-run
+          git commit -m "Bot run: $(date)" || true
+          git push || true
